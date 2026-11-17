@@ -16,71 +16,59 @@ import AppKit
 #endif
 
 protocol LifecycleEventHandling: Sendable {
-  @MainActor func onWillEnterForeground() async
+  @MainActor func onWillEnterForeground()
 
-  @MainActor func onDidEnterBackground() async
+  @MainActor func onDidEnterBackground()
 }
 
 /// Manages app lifecycle notifications and coordinates foreground/background transitions.
 @MainActor
 final class LifecycleManager {
-  private var willEnterForegroundTask: Task<Void, Never>?
-
-  private var didEnterBackgroundTask: Task<Void, Never>?
+  private var observations: [NotificationRegistration] = []
 
   private let handler: any LifecycleEventHandling
 
   private let notificationCenter: NotificationCenter
 
-  private let tasks: TaskCoordinator
-
   init(
     handler: any LifecycleEventHandling,
-    notificationCenter: NotificationCenter = .default,
-    tasks: TaskCoordinator = TaskCoordinator()
+    notificationCenter: NotificationCenter = .default
   ) {
     self.handler = handler
     self.notificationCenter = notificationCenter
-    self.tasks = tasks
   }
 
   func startObserving() {
-    willEnterForegroundTask?.cancel()
-    didEnterBackgroundTask?.cancel()
-
-    let willEnterForeground = notificationCenter.notifications(named: Self.willEnterForegroundNotification)
-    let didEnterBackground = notificationCenter.notifications(named: Self.didEnterBackgroundNotification)
-
-    let foregroundTask = Task { [handler] in
-      for await _ in willEnterForeground.map({ _ in () }) {
-        guard !Task.isCancelled else { break }
-        await handler.onWillEnterForeground()
-      }
-    }
-    willEnterForegroundTask = foregroundTask
-    tasks.track(foregroundTask)
-
-    let backgroundTask = Task { [handler] in
-      for await _ in didEnterBackground.map({ _ in () }) {
-        guard !Task.isCancelled else { break }
-        await handler.onDidEnterBackground()
-      }
-    }
-    didEnterBackgroundTask = backgroundTask
-    tasks.track(backgroundTask)
+    stopObserving()
+    observations = [
+      NotificationRegistration(center: notificationCenter, name: Self.willEnterForegroundNotification) { [weak self] in
+        self?.handler.onWillEnterForeground()
+      },
+      NotificationRegistration(center: notificationCenter, name: Self.didEnterBackgroundNotification) { [weak self] in
+        self?.handler.onDidEnterBackground()
+      },
+    ]
   }
 
   func stopObserving() {
-    willEnterForegroundTask?.cancel()
-    willEnterForegroundTask = nil
+    observations.removeAll()
+  }
+}
 
-    didEnterBackgroundTask?.cancel()
-    didEnterBackgroundTask = nil
+private final class NotificationRegistration {
+  private let center: NotificationCenter
+  private let token: NSObjectProtocol
+
+  init(center: NotificationCenter, name: Notification.Name, operation: @escaping @MainActor @Sendable () -> Void) {
+    self.center = center
+    // System lifecycle notifications arrive on the UI thread, before scene-phase consumers.
+    token = center.addObserver(forName: name, object: nil, queue: nil) { _ in
+      MainActor.assumeIsolated { operation() }
+    }
   }
 
   deinit {
-    willEnterForegroundTask?.cancel()
-    didEnterBackgroundTask?.cancel()
+    center.removeObserver(token)
   }
 }
 
