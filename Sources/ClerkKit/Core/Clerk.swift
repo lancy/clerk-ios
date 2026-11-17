@@ -469,6 +469,24 @@ extension Clerk {
     try await refreshClient(skipClientId: false)
   }
 
+  /// Waits for the SDK's automatic client refresh for the current foreground lifecycle.
+  ///
+  /// Startup and the first foreground event share one refresh. The successful result
+  /// remains available until the app enters the background,
+  /// the stored identity changes, or an explicit refresh starts. Cached client data
+  /// alone does not complete this wait.
+  /// Canceling a waiter does not cancel the SDK-owned refresh.
+  /// A failed refresh throws its error and can be retried by a later call.
+  ///
+  /// Use ``refreshClient()`` to explicitly fetch the client again, such as after a failure.
+  ///
+  /// - Returns: The current client after the automatic refresh completes, or `nil`
+  ///   when no client is available.
+  @discardableResult
+  public func waitForClientRefresh() async throws -> Client? {
+    try await runtime.waitForClientRefresh()
+  }
+
   /// Refreshes the current client from the API.
   ///
   /// - Parameter skipClientId: When `true`, omits the currently cached client id
@@ -477,6 +495,12 @@ extension Clerk {
   ///   native client cannot conflict with the newly stored token.
   @discardableResult
   func refreshClient(skipClientId: Bool) async throws -> Client? {
+    try Task.checkCancellation()
+    runtime.invalidateLifecycleClientRefresh()
+    return try await fetchClient(skipClientId: skipClientId)
+  }
+
+  func fetchClient(skipClientId: Bool) async throws -> Client? {
     try Task.checkCancellation()
     let runtime = runtimeScope
     let clientResponseGeneration = clientResponseGeneration

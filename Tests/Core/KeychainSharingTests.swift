@@ -53,7 +53,7 @@ struct KeychainSharingTests {
     try await second.respond(.client(signedIn("client")), date: 100)
 
     try first.clerk.identityController.clearIdentity()
-    await second.clerk.runtime.onWillEnterForeground()
+    second.clerk.runtime.onWillEnterForeground()
 
     #expect(second.clerk.deviceToken == nil)
     #expect(second.clerk.client == nil)

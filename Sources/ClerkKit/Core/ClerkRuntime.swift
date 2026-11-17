@@ -25,8 +25,38 @@ final class ClerkRuntime {
 
   private var environmentRefreshTask: Task<Clerk.Environment, Error>?
   private var environmentRefreshTaskID: UUID?
-  private var startupClientRefreshTask: Task<Void, Never>?
-  private var startupClientRefreshID: UUID?
+  private struct ClientRefresh {
+    let id: UUID
+    let generation: ClientResponseGeneration
+    let task: Task<Client?, Error>
+  }
+
+  @MainActor
+  private final class ClientRefreshWaiter {
+    private var result: Result<Client?, Error>?
+    private var continuation: CheckedContinuation<Client?, Error>?
+
+    func value() async throws -> Client? {
+      try Task.checkCancellation()
+      return try await withCheckedThrowingContinuation { continuation in
+        if let result {
+          continuation.resume(with: result)
+        } else {
+          self.continuation = continuation
+        }
+      }
+    }
+
+    func resolve(_ result: Result<Client?, Error>) {
+      guard case nil = self.result else { return }
+      self.result = result
+      continuation?.resume(with: result)
+      continuation = nil
+    }
+  }
+
+  private var lifecycleClientRefresh: ClientRefresh?
+  private var startupClientRefreshTask: ClientRefresh?
   private var invalidAuthRefreshTask: Task<Void, Never>?
 
   private static let startupRefreshRetryPolicy = RetryPolicy(
@@ -59,7 +89,7 @@ final class ClerkRuntime {
       },
       tasks: tasks
     )
-    let lifecycleManager = LifecycleManager(handler: self, tasks: tasks)
+    let lifecycleManager = LifecycleManager(handler: self)
     self.sessionPollingManager = sessionPollingManager
     self.lifecycleManager = lifecycleManager
     sessionPollingManager.startPolling()
@@ -126,6 +156,8 @@ final class ClerkRuntime {
 
   private func cancelRefreshes() {
     cancelStartupClientRefresh()
+    lifecycleClientRefresh?.task.cancel()
+    lifecycleClientRefresh = nil
     invalidAuthRefreshTask?.cancel()
     invalidAuthRefreshTask = nil
     environmentRefreshTask?.cancel()
@@ -201,41 +233,83 @@ extension ClerkRuntime {
 
   func startStartupClientRefreshIfNeeded() {
     guard startupClientRefreshTask == nil else { return }
-
-    let retryPolicy = Self.startupRefreshRetryPolicy
-    let startupClientRefreshID = UUID()
-    self.startupClientRefreshID = startupClientRefreshID
-    startupClientRefreshTask = tasks.task { @MainActor [weak self] in
-      guard let self, let clerk else { return }
-      defer {
-        if self.startupClientRefreshID == startupClientRefreshID {
-          self.startupClientRefreshTask = nil
-          self.startupClientRefreshID = nil
-        }
-      }
-      do {
-        _ = try await retryingOperation(
-          policy: retryPolicy,
-          operationName: "client refresh"
-        ) {
-          try Task.checkCancellation()
-          try await clerk.refreshClient(skipClientId: false)
-        }
-      } catch is CancellationError {
-        return
-      } catch {
-        ClerkLogger.logError(error, message: "Failed to load client")
-      }
-    }
+    lifecycleClientRefresh = nil
+    startupClientRefreshTask = clientRefreshForLifecycle(retryingStartup: true)
   }
 
   @discardableResult
   func cancelStartupClientRefreshTask() -> Bool {
     guard let startupClientRefreshTask else { return false }
     self.startupClientRefreshTask = nil
-    startupClientRefreshID = nil
-    startupClientRefreshTask.cancel()
+    startupClientRefreshTask.task.cancel()
+    if lifecycleClientRefresh?.id == startupClientRefreshTask.id {
+      lifecycleClientRefresh = nil
+    }
     return true
+  }
+
+  func waitForClientRefresh() async throws -> Client? {
+    try Task.checkCancellation()
+    guard let clerk, let refresh = clientRefreshForLifecycle() else { throw CancellationError() }
+    let scope = clerk.runtimeScope
+    let waiter = ClientRefreshWaiter()
+    let observation = Task { @MainActor in
+      await waiter.resolve(refresh.task.result)
+    }
+    tasks.track(observation)
+    defer { observation.cancel() }
+    _ = try await withTaskCancellationHandler {
+      try await waiter.value()
+    } onCancel: {
+      Task { @MainActor in waiter.resolve(.failure(CancellationError())) }
+    }
+    try Task.checkCancellation()
+    try scope.validateStableRuntime()
+    return clerk.client
+  }
+
+  func invalidateLifecycleClientRefresh() {
+    lifecycleClientRefresh = nil
+  }
+
+  private func clientRefreshForLifecycle(retryingStartup: Bool = false) -> ClientRefresh? {
+    guard let clerk else { return nil }
+    let generation = clerk.clientResponseGeneration
+    if let lifecycleClientRefresh, lifecycleClientRefresh.generation == generation {
+      return lifecycleClientRefresh
+    }
+
+    let scope = clerk.runtimeScope
+    let policy = retryingStartup
+      ? Self.startupRefreshRetryPolicy
+      : RetryPolicy(maxAttempts: 1, initialDelay: .zero, maximumDelay: .zero)
+    let id = UUID()
+    let task = Task { @MainActor [weak self, weak clerk] in
+      defer {
+        if self?.startupClientRefreshTask?.id == id {
+          self?.startupClientRefreshTask = nil
+        }
+      }
+      do {
+        guard let clerk else { throw CancellationError() }
+        return try await retryingOperation(policy: policy, operationName: "client refresh") {
+          try scope.validateStableRuntime()
+          return try await clerk.fetchClient(skipClientId: false)
+        }
+      } catch {
+        if self?.lifecycleClientRefresh?.id == id {
+          self?.lifecycleClientRefresh = nil
+        }
+        if retryingStartup, !(error is CancellationError) {
+          ClerkLogger.logError(error, message: "Failed to load client")
+        }
+        throw error
+      }
+    }
+    tasks.track(task)
+    let refresh = ClientRefresh(id: id, generation: generation, task: task)
+    lifecycleClientRefresh = refresh
+    return refresh
   }
 
   var isStartupClientRefreshInProgress: Bool {
@@ -275,7 +349,7 @@ extension ClerkRuntime {
 }
 
 extension ClerkRuntime: LifecycleEventHandling {
-  func onWillEnterForeground() async {
+  func onWillEnterForeground() {
     guard let clerk else { return }
     sessionPollingManager?.startPolling()
 
@@ -288,10 +362,15 @@ extension ClerkRuntime: LifecycleEventHandling {
     }
     #endif
 
-    tasks.task { [weak self, weak clerk] in
-      guard let self, let clerk else { return }
+    guard let refresh = clientRefreshForLifecycle() else { return }
+    tasks.task { [weak self] in
+      guard let self else { return }
       do {
-        try await clerk.refreshClient()
+        try Task.checkCancellation()
+        _ = try await refresh.task.value
+        try Task.checkCancellation()
+      } catch is CancellationError {
+        return
       } catch {
         ClerkLogger.logError(error, message: "Failed to refresh client on foreground")
       }
@@ -309,7 +388,8 @@ extension ClerkRuntime: LifecycleEventHandling {
     }
   }
 
-  func onDidEnterBackground() async {
+  func onDidEnterBackground() {
+    invalidateLifecycleClientRefresh()
     sessionPollingManager?.stopPolling()
 
     let telemetry = dependencies.telemetryCollector
