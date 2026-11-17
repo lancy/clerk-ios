@@ -29,6 +29,7 @@ final class ClerkRuntime {
     let id: UUID
     let generation: ClientResponseGeneration
     let task: Task<Client?, Error>
+    var isCompleted = false
   }
 
   @MainActor
@@ -272,6 +273,12 @@ extension ClerkRuntime {
     lifecycleClientRefresh = nil
   }
 
+  func invalidateCompletedClientRefresh() {
+    if lifecycleClientRefresh?.isCompleted == true {
+      lifecycleClientRefresh = nil
+    }
+  }
+
   private func clientRefreshForLifecycle(retryingStartup: Bool = false) -> ClientRefresh? {
     guard let clerk else { return nil }
     let generation = clerk.clientResponseGeneration
@@ -286,6 +293,9 @@ extension ClerkRuntime {
     let id = UUID()
     let task = Task { @MainActor [weak self, weak clerk] in
       defer {
+        if self?.lifecycleClientRefresh?.id == id {
+          self?.lifecycleClientRefresh?.isCompleted = true
+        }
         if self?.startupClientRefreshTask?.id == id {
           self?.startupClientRefreshTask = nil
         }

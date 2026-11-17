@@ -472,9 +472,10 @@ extension Clerk {
   /// Waits for the SDK's automatic client refresh for the current foreground lifecycle.
   ///
   /// Startup and the first foreground event share one refresh. The successful result
-  /// remains available until the app enters the background,
-  /// the stored identity changes, or an explicit refresh starts. Cached client data
-  /// alone does not complete this wait.
+  /// remains available until the app enters the background, the stored identity
+  /// changes, or an explicit refresh invalidates the completed result. An explicit
+  /// refresh does not replace a pending automatic refresh. Cached client data alone
+  /// does not complete this wait.
   /// Canceling a waiter does not cancel the SDK-owned refresh.
   /// A failed refresh throws its error and can be retried by a later call.
   ///
@@ -496,7 +497,7 @@ extension Clerk {
   @discardableResult
   func refreshClient(skipClientId: Bool) async throws -> Client? {
     try Task.checkCancellation()
-    runtime.invalidateLifecycleClientRefresh()
+    runtime.invalidateCompletedClientRefresh()
     return try await fetchClient(skipClientId: skipClientId)
   }
 

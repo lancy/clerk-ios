@@ -55,6 +55,36 @@ struct ClientRefreshTests {
   }
 
   @Test
+  func anExplicitRefreshDoesNotReplaceThePendingAutomaticRefresh() async throws {
+    let gate = ResponseGate()
+    let transport = FakeTransport.mockDefaults()
+    var request = 0
+    transport.stubReply(ClientAPI.get()) { _ in
+      request += 1
+      let sequence = request
+      var client = Client.mockSignedOut
+      client.id = "client-\(sequence)"
+      if sequence == 1 {
+        gate.open("startup-requested")
+        await gate.wait("startup-response")
+      }
+      return .init(ClientResponse(response: client, client: nil), requestSequence: sequence)
+    }
+    let clerk = try makeClerk(transport: transport)
+    defer {
+      gate.open("startup-response")
+      clerk.cleanupManagers()
+    }
+    await gate.wait("startup-requested")
+    #expect(try await clerk.refreshClient()?.id == "client-2")
+
+    clerk.runtime.onWillEnterForeground()
+    gate.open("startup-response")
+    #expect(try await clerk.waitForClientRefresh()?.id == "client-2")
+    #expect(clientRequests(transport) == 2)
+  }
+
+  @Test
   func anAutomaticRefreshWithNoClientStillCompletes() async throws {
     let transport = FakeTransport.answeringClient { nil }
     let clerk = try makeClerk(transport: transport)
