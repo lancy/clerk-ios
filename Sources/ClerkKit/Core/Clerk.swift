@@ -477,6 +477,7 @@ extension Clerk {
   /// refresh does not replace a pending automatic refresh. Cached client data alone
   /// does not complete this wait.
   /// Canceling a waiter does not cancel the SDK-owned refresh.
+  /// A superseded lifecycle or identity cancels the wait.
   /// A failed refresh throws its error and can be retried by a later call.
   ///
   /// Use ``refreshClient()`` to explicitly fetch the client again, such as after a failure.
@@ -498,10 +499,11 @@ extension Clerk {
   func refreshClient(skipClientId: Bool) async throws -> Client? {
     try Task.checkCancellation()
     runtime.invalidateCompletedClientRefresh()
-    return try await fetchClient(skipClientId: skipClientId)
+    let fetched = try await fetchClient(skipClientId: skipClientId)
+    return fetched.client
   }
 
-  func fetchClient(skipClientId: Bool) async throws -> Client? {
+  func fetchClient(skipClientId: Bool) async throws -> (client: Client?, generation: ClientResponseGeneration?) {
     try Task.checkCancellation()
     let runtime = runtimeScope
     let clientResponseGeneration = clientResponseGeneration
@@ -516,7 +518,9 @@ extension Clerk {
         clientResponseGeneration: clientResponseGeneration
       )
     }
-    return client
+    let acceptedCurrentGeneration = self.clientResponseGeneration == clientResponseGeneration
+      || response.requestSequence.map { identityController.isLatestAcceptedResponse(sequence: $0) } == true
+    return (client, acceptedCurrentGeneration ? self.clientResponseGeneration : nil)
   }
 
   /// Refreshes the current environment from the API.

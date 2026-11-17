@@ -67,6 +67,10 @@ extension ClerkIdentityController {
     responseOrderingGate.reset()
   }
 
+  func isLatestAcceptedResponse(sequence: Int) -> Bool {
+    responseOrderingGate.lastAcceptedSequence == sequence
+  }
+
   func recordServerDate(_ serverDate: Date, receivedAt: Date) {
     serverClock.record(serverDate: serverDate, receivedAt: receivedAt)
   }

@@ -27,7 +27,7 @@ final class ClerkRuntime {
   private var environmentRefreshTaskID: UUID?
   private struct ClientRefresh {
     let id: UUID
-    let generation: ClientResponseGeneration
+    var generation: ClientResponseGeneration
     let task: Task<Client?, Error>
     var isCompleted = false
   }
@@ -266,6 +266,11 @@ extension ClerkRuntime {
     }
     try Task.checkCancellation()
     try scope.validateStableRuntime()
+    guard lifecycleClientRefresh?.id == refresh.id,
+          lifecycleClientRefresh?.generation == clerk.clientResponseGeneration
+    else {
+      throw CancellationError()
+    }
     return clerk.client
   }
 
@@ -304,7 +309,12 @@ extension ClerkRuntime {
         guard let clerk else { throw CancellationError() }
         return try await retryingOperation(policy: policy, operationName: "client refresh") {
           try scope.validateStableRuntime()
-          return try await clerk.fetchClient(skipClientId: false)
+          let fetched = try await clerk.fetchClient(skipClientId: false)
+          guard let generation = fetched.generation else { throw CancellationError() }
+          if self?.lifecycleClientRefresh?.id == id {
+            self?.lifecycleClientRefresh?.generation = generation
+          }
+          return fetched.client
         }
       } catch {
         if self?.lifecycleClientRefresh?.id == id {

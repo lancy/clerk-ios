@@ -55,6 +55,32 @@ struct ClientRefreshTests {
   }
 
   @Test
+  func theAutomaticResponseCanEstablishItsOwnDeviceTokenWithoutAnotherRefresh() async throws {
+    let transport = FakeTransport.mockDefaults()
+    let clerk = try makeClerk(transport: transport)
+    defer { clerk.cleanupManagers() }
+    let client = Client.mockSignedOut
+    transport.stubReply(ClientAPI.get()) { _ in
+      try await clerk.identityController.applyNetworkResponse(ClientSyncResponseContext(
+        update: .client(client),
+        deviceTokenUpdate: .set("response-device-token"),
+        requestDeviceToken: nil,
+        serverDate: nil,
+        isCanonicalClientRequest: true,
+        clientResponseGeneration: clerk.clientResponseGeneration,
+        responseSequence: 1
+      ))
+      return .init(ClientResponse(response: client, client: nil), requestSequence: 1)
+    }
+
+    #expect(try await clerk.waitForClientRefresh()?.id == client.id)
+    #expect(clerk.deviceToken == "response-device-token")
+    clerk.runtime.onWillEnterForeground()
+    #expect(try await clerk.waitForClientRefresh()?.id == client.id)
+    #expect(clientRequests(transport) == 1)
+  }
+
+  @Test
   func anExplicitRefreshDoesNotReplaceThePendingAutomaticRefresh() async throws {
     let gate = ResponseGate()
     let transport = FakeTransport.mockDefaults()
@@ -205,7 +231,7 @@ struct ClientRefreshTests {
     clerk.runtime.onWillEnterForeground()
     #expect(try await clerk.waitForClientRefresh()?.id == "client-2")
     gate.open("old-response")
-    #expect(try await original.value?.id == "client-2")
+    await #expect(throws: CancellationError.self) { try await original.value }
     #expect(clerk.client?.id == "client-2")
     #expect(clientRequests(transport) == 2)
   }
@@ -289,9 +315,44 @@ struct ClientRefreshTests {
     #expect(try await clerk.setDeviceToken("replacement-token", expected: nil))
     #expect(try await clerk.waitForClientRefresh()?.id == "client-2")
     gate.open("old-response")
-    #expect(try await original.value?.id == "client-2")
+    await #expect(throws: CancellationError.self) { try await original.value }
 
     #expect(clerk.client?.id == "client-2")
+    #expect(clientRequests(transport) == 2)
+  }
+
+  @Test
+  func anOldResponseDoesNotCompleteTheNewIdentityRefreshFromCachedData() async throws {
+    let gate = ResponseGate()
+    var request = 0
+    let transport = FakeTransport.answeringClient {
+      request += 1
+      var client = Client.mockSignedOut
+      client.id = "client-\(request)"
+      if request == 1 {
+        gate.open("old-requested")
+        await gate.wait("old-response")
+      }
+      return client
+    }
+    let clerk = try makeClerk(transport: transport)
+    defer {
+      gate.open("old-response")
+      clerk.cleanupManagers()
+    }
+    let original = Task {
+      gate.open("old-waiter")
+      return try await clerk.waitForClientRefresh()
+    }
+    defer { original.cancel() }
+    await gate.wait("old-requested")
+    await gate.wait("old-waiter")
+    #expect(try await clerk.setDeviceToken("replacement-token", expected: nil))
+    gate.open("old-response")
+
+    await #expect(throws: CancellationError.self) { try await original.value }
+    #expect(clerk.client == nil)
+    #expect(try await clerk.waitForClientRefresh()?.id == "client-2")
     #expect(clientRequests(transport) == 2)
   }
 
