@@ -1,0 +1,76 @@
+name: Lifecycle refresh verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact contribution commit to verify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: macOS checks and unit tests
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.target_sha }}
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Repository checks
+        run: make check
+      - name: Core unit tests
+        if: ${{ !cancelled() }}
+        run: make test
+
+  simulator:
+    name: iOS lifecycle regression tests
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.target_sha }}
+          persist-credentials: false
+      - name: Prepare package workspace and simulator
+        id: simulator
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          mkdir -p .swiftpm/xcode/package.xcworkspace
+          cat > .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata <<'WORKSPACE'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Workspace version="1.0"><FileRef location="self:"></FileRef></Workspace>
+          WORKSPACE
+          udid="$(xcrun simctl list devices available | sed -nE 's/^    (iPhone[^()]*) \(([0-9A-F-]{36})\) \(.*$/\2/p' | head -n1)"
+          test -n "$udid"
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+      - name: Run SDK lifecycle tests on iOS
+        env:
+          SIMULATOR_ID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -workspace .swiftpm/xcode/package.xcworkspace \
+            -scheme Clerk-Package \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_ID" \
+            -only-testing:ClerkKitTests/ClientRefreshTests \
+            -only-testing:ClerkKitTests/LifecycleManagerTests \
+            -only-testing:ClerkKitTests/KeychainSharingTests \
+            -resultBundlePath "$RUNNER_TEMP/lifecycle-tests.xcresult" \
+            CODE_SIGNING_ALLOWED=NO
+      - name: Upload simulator results
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: lifecycle-tests
+          path: ${{ runner.temp }}/lifecycle-tests.xcresult
+          if-no-files-found: ignore
