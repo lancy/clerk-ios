@@ -143,6 +143,27 @@ struct ClientRefreshTests {
   }
 
   @Test
+  func aBackgroundReadDoesNotReplaceTheNextForegroundRefresh() async throws {
+    var request = 0
+    let transport = FakeTransport.answeringClient {
+      request += 1
+      var client = Client.mockSignedOut
+      client.id = "client-\(request)"
+      return client
+    }
+    let clerk = try makeClerk(transport: transport)
+    defer { clerk.cleanupManagers() }
+    #expect(try await clerk.waitForClientRefresh()?.id == "client-1")
+
+    clerk.runtime.onDidEnterBackground()
+    #expect(try await clerk.waitForClientRefresh()?.id == "client-2")
+    clerk.runtime.onWillEnterForeground()
+    #expect(try await clerk.waitForClientRefresh()?.id == "client-3")
+    #expect(try await clerk.waitForClientRefresh()?.id == "client-3")
+    #expect(clientRequests(transport) == 3)
+  }
+
+  @Test
   func aFailedRefreshIsNotCompletedByTheCachedClientAndCanBeRetriedOnForeground() async throws {
     let failure = ClerkAPIError(code: "test_rejected", message: "Client refresh rejected", statusCode: 403)
     let transport = FakeTransport.answeringClient { throw failure }

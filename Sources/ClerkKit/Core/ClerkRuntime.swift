@@ -59,6 +59,7 @@ final class ClerkRuntime {
   private var lifecycleClientRefresh: ClientRefresh?
   private var startupClientRefreshTask: ClientRefresh?
   private var invalidAuthRefreshTask: Task<Void, Never>?
+  private var foregroundNeedsClientRefresh = false
 
   private static let startupRefreshRetryPolicy = RetryPolicy(
     maxAttempts: 3,
@@ -156,6 +157,7 @@ final class ClerkRuntime {
   }
 
   private func cancelRefreshes() {
+    foregroundNeedsClientRefresh = false
     cancelStartupClientRefresh()
     lifecycleClientRefresh?.task.cancel()
     lifecycleClientRefresh = nil
@@ -371,6 +373,10 @@ extension ClerkRuntime {
 extension ClerkRuntime: LifecycleEventHandling {
   func onWillEnterForeground() {
     guard let clerk else { return }
+    if foregroundNeedsClientRefresh {
+      invalidateLifecycleClientRefresh()
+      foregroundNeedsClientRefresh = false
+    }
     sessionPollingManager?.startPolling()
 
     clerk.identityController.adoptStoredDeviceToken()
@@ -409,6 +415,7 @@ extension ClerkRuntime: LifecycleEventHandling {
   }
 
   func onDidEnterBackground() {
+    foregroundNeedsClientRefresh = true
     invalidateLifecycleClientRefresh()
     sessionPollingManager?.stopPolling()
 
